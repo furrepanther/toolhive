@@ -23,10 +23,14 @@ type installSkillRequest struct {
 	Version string `json:"version,omitempty"`
 	// Scope for the installation
 	Scope skills.Scope `json:"scope,omitempty"`
+	// ProjectRoot is the project root path for project-scoped installs
+	ProjectRoot string `json:"project_root,omitempty"`
 	// Client is the target client (e.g., "claude-code")
 	Client string `json:"client,omitempty"`
 	// Force allows overwriting unmanaged skill directories
 	Force bool `json:"force,omitempty"`
+	// Group is the group name to add the skill to after installation
+	Group string `json:"group,omitempty"`
 }
 
 // installSkillResponse represents the response after installing a skill.

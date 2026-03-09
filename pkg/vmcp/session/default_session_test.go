@@ -104,6 +104,7 @@ func buildTestSession(
 		resources:       resources,
 		prompts:         prompts,
 		backendSessions: map[string]string{backendID: "backend-session-abc"},
+		queue:           newAdmissionQueue(),
 	}
 }
 
@@ -184,7 +185,7 @@ func TestDefaultSession_CallTool(t *testing.T) {
 				nil, nil,
 			)
 
-			result, err := sess.CallTool(context.Background(), tt.toolName, nil, nil)
+			result, err := sess.CallTool(context.Background(), nil, tt.toolName, nil, nil)
 			if tt.wantErr {
 				require.Error(t, err)
 				if tt.wantErrIs != nil {
@@ -249,7 +250,7 @@ func TestDefaultSession_ReadResource(t *testing.T) {
 				nil,
 			)
 
-			result, err := sess.ReadResource(context.Background(), tt.uri)
+			result, err := sess.ReadResource(context.Background(), nil, tt.uri)
 			if tt.wantErr {
 				require.Error(t, err)
 				if tt.wantErrIs != nil {
@@ -312,7 +313,7 @@ func TestDefaultSession_GetPrompt(t *testing.T) {
 				[]vmcp.Prompt{{Name: "greet", BackendID: "b1"}},
 			)
 
-			result, err := sess.GetPrompt(context.Background(), tt.prompt, nil)
+			result, err := sess.GetPrompt(context.Background(), nil, tt.prompt, nil)
 			if tt.wantErr {
 				require.Error(t, err)
 				if tt.wantErrIs != nil {
@@ -372,7 +373,7 @@ func TestDefaultSession_Close(t *testing.T) {
 
 		var callDone atomic.Bool
 		go func() {
-			_, _ = sess.CallTool(context.Background(), "slow", nil, nil)
+			_, _ = sess.CallTool(context.Background(), nil, "slow", nil, nil)
 			callDone.Store(true)
 		}()
 
@@ -421,13 +422,13 @@ func TestDefaultSession_Close(t *testing.T) {
 		)
 		require.NoError(t, sess.Close())
 
-		_, err := sess.CallTool(context.Background(), "search", nil, nil)
+		_, err := sess.CallTool(context.Background(), nil, "search", nil, nil)
 		assert.ErrorIs(t, err, ErrSessionClosed)
 
-		_, err = sess.ReadResource(context.Background(), "file://x")
+		_, err = sess.ReadResource(context.Background(), nil, "file://x")
 		assert.ErrorIs(t, err, ErrSessionClosed)
 
-		_, err = sess.GetPrompt(context.Background(), "greet", nil)
+		_, err = sess.GetPrompt(context.Background(), nil, "greet", nil)
 		assert.ErrorIs(t, err, ErrSessionClosed)
 	})
 }
@@ -451,16 +452,17 @@ func TestDefaultSession_ErrNoBackendClient(t *testing.T) {
 		resources:       []vmcp.Resource{{URI: "file://readme", BackendID: "b1"}},
 		prompts:         []vmcp.Prompt{{Name: "greet", BackendID: "b1"}},
 		backendSessions: map[string]string{},
+		queue:           newAdmissionQueue(),
 	}
 	defer func() { _ = sess.Close() }()
 
-	_, err := sess.CallTool(context.Background(), "search", nil, nil)
+	_, err := sess.CallTool(context.Background(), nil, "search", nil, nil)
 	require.ErrorIs(t, err, ErrNoBackendClient)
 
-	_, err = sess.ReadResource(context.Background(), "file://readme")
+	_, err = sess.ReadResource(context.Background(), nil, "file://readme")
 	require.ErrorIs(t, err, ErrNoBackendClient)
 
-	_, err = sess.GetPrompt(context.Background(), "greet", nil)
+	_, err = sess.GetPrompt(context.Background(), nil, "greet", nil)
 	require.ErrorIs(t, err, ErrNoBackendClient)
 }
 
@@ -484,6 +486,7 @@ func TestDefaultSession_Close_AllBackendsAttemptedOnError(t *testing.T) {
 			Prompts:   map[string]*vmcp.BackendTarget{},
 		},
 		backendSessions: map[string]string{},
+		queue:           newAdmissionQueue(),
 	}
 
 	err := sess.Close()
@@ -733,7 +736,7 @@ func TestNewSessionFactory_CapabilityNameConflictIsResolvedDeterministically(t *
 	assert.Equal(t, "alpha", sess.Prompts()[0].BackendID)
 
 	// Calling the conflicted tool must reach "alpha", not "zeta".
-	result, err := sess.CallTool(context.Background(), "fetch", nil, nil)
+	result, err := sess.CallTool(context.Background(), nil, "fetch", nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 }
@@ -1073,4 +1076,51 @@ func TestWithBackendInitTimeout_IgnoresNonPositive(t *testing.T) {
 
 	WithBackendInitTimeout(-time.Second)(f)
 	assert.Equal(t, defaultBackendInitTimeout, f.backendInitTimeout)
+}
+
+func TestValidateSessionID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		id      string
+		wantErr bool
+	}{
+		{name: "valid UUID", id: "550e8400-e29b-41d4-a716-446655440000", wantErr: false},
+		{name: "valid short ID", id: "abc123", wantErr: false},
+		{name: "all visible ASCII boundaries", id: "!~", wantErr: false},
+		{name: "empty string", id: "", wantErr: true},
+		{name: "contains space (0x20)", id: "a b", wantErr: true},
+		{name: "contains DEL (0x7F)", id: "a\x7fb", wantErr: true},
+		{name: "contains control char (0x01)", id: "a\x01b", wantErr: true},
+		{name: "contains newline", id: "a\nb", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateSessionID(tt.id)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestMakeSessionWithID_InvalidIDReturnsError(t *testing.T) {
+	t.Parallel()
+
+	f := newSessionFactoryWithConnector(func(_ context.Context, _ *vmcp.BackendTarget, _ *auth.Identity) (internalbk.Session, *vmcp.CapabilityList, error) {
+		return nil, nil, nil
+	})
+
+	_, err := f.MakeSessionWithID(context.Background(), "", nil, true, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must not be empty")
+
+	_, err = f.MakeSessionWithID(context.Background(), "bad id", nil, true, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid character")
 }
